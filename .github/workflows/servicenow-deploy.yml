@@ -1,0 +1,211 @@
+name: ServiceNow non-production SDK deploy
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'zelviro-app/**'
+    paths:
+      - 'src/fluent/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'now.config.json'
+      - '.github/workflows/servicenow-deploy.yml'
+  push:
+    branches:
+      - main
+      - 'zelviro-app/**'
+      - 'zelviro-prepare/**'
+  workflow_dispatch:
+    inputs:
+      preflight_only:
+        description: Validate a generated-key PR head without deployment
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: servicenow-nonprod-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap_application:
+    name: Prepare selected ServiceNow application
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'zelviro-prepare/')
+    permissions:
+      actions: write
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: servicenow-nonprod
+    steps:
+      - name: Check out the trusted preparation request
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - name: Use Node.js 20
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 20
+      - name: Validate the application preparation manifest
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = 'zelviro/application-preparation.json'
+          const manifest = JSON.parse(fs.readFileSync(path, 'utf8'))
+          const isImport = manifest?.schemaVersion === 1 && !manifest?.operation
+          const isCreate = manifest?.schemaVersion === 2 && manifest?.operation === 'create'
+          const validSysId = /^[a-f0-9]{32}$/.test(manifest?.application?.sysId || '')
+          const validImportScope = /^(global|x_[a-z0-9_]{3,100})$/.test(manifest?.application?.scope || '')
+          const validCreateScope = /^x_[a-z0-9]+_[a-z0-9_]+$/.test(manifest?.application?.scope || '') && manifest.application.scope.length <= 18
+          const validName = typeof manifest?.application?.name === 'string' && manifest.application.name.trim().length >= 3 && manifest.application.name.trim().length <= 100 && !/[\u0000-\u001f\u007f]/.test(manifest.application.name)
+          const packageName = isCreate ? manifest?.application?.packageName : 'zelviro-' + String(manifest?.application?.scope || '').replace(/_/g, '-')
+          const validPackage = /^[a-z0-9][a-z0-9-]{2,79}$/.test(packageName || '')
+          const validSourceBranch = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(manifest?.sourceTemplateBranch || '') && !manifest.sourceTemplateBranch.includes('..')
+          const expectedBranch = isCreate && validCreateScope
+            ? 'zelviro-app/' + manifest.application.scope.slice(0, 48) + '-new'
+            : isImport && validImportScope && validSysId
+              ? 'zelviro-app/' + manifest.application.scope.slice(0, 48) + '-' + manifest.application.sysId.slice(0, 12)
+              : ''
+          const validBranch = manifest?.targetBranch === expectedBranch
+          if ((!isImport && !isCreate) || manifest?.sdkVersion !== '4.9.2' || (isImport && (!validSysId || !validImportScope)) || (isCreate && (!validCreateScope || !validName || !validPackage)) || !validSourceBranch || !validBranch) {
+            throw new Error('Invalid Zelviro application-preparation manifest')
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, [
+            'APP_OPERATION=' + (isCreate ? 'create' : 'import'),
+            'APP_SYS_ID=' + (isImport ? manifest.application.sysId : ''),
+            'APP_NAME_B64=' + Buffer.from(manifest.application.name.trim(), 'utf8').toString('base64'),
+            'APP_SCOPE=' + manifest.application.scope,
+            'PACKAGE_NAME=' + packageName,
+            'TARGET_BRANCH=' + manifest.targetBranch,
+            'SOURCE_TEMPLATE_BRANCH=' + manifest.sourceTemplateBranch,
+          ].join('\n') + '\n')
+          NODE
+      - name: Import the exact application and publish its isolated workspace
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SN_SDK_NODE_ENV: SN_SDK_CI_INSTALL
+          SN_SDK_AUTH_TYPE: oauth
+          SN_SDK_INSTANCE_URL: ${{ secrets.SN_SDK_INSTANCE_URL }}
+          SN_SDK_OAUTH_CLIENT_ID: ${{ secrets.SN_SDK_OAUTH_CLIENT_ID }}
+          SN_SDK_OAUTH_CLIENT_SECRET: ${{ secrets.SN_SDK_OAUTH_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$SOURCE_TEMPLATE_BRANCH"
+          test "$(git rev-parse HEAD^)" = "$(git rev-parse "origin/$SOURCE_TEMPLATE_BRANCH")"
+          test "$(git diff --name-only HEAD^ HEAD)" = "zelviro/application-preparation.json"
+          if [ "$APP_OPERATION" = "create" ]; then
+            PREFLIGHT_ONLY=false
+          else
+            PREFLIGHT_ONLY=true
+          fi
+          if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
+            echo "The application workspace already exists."
+            gh workflow run servicenow-deploy.yml --ref "$TARGET_BRANCH" -f preflight_only="$PREFLIGHT_ONLY"
+            exit 0
+          fi
+          PREP_DIR="$RUNNER_TEMP/zelviro-application"
+          mkdir -p "$PREP_DIR"
+          cd "$PREP_DIR"
+          if [ "$APP_OPERATION" = "create" ]; then
+            APP_NAME="$(printf '%s' "$APP_NAME_B64" | base64 --decode)"
+            npm exec --yes --package=@servicenow/sdk@4.9.2 -- now-sdk init --appName "$APP_NAME" --packageName "$PACKAGE_NAME" --scopeName "$APP_SCOPE" --template base
+          else
+            npm exec --yes --package=@servicenow/sdk@4.9.2 -- now-sdk init --from "$APP_SYS_ID" --packageName "$PACKAGE_NAME" --template base
+          fi
+          npm install
+          if [ -d metadata/update ]; then
+            npx now-sdk transform --from metadata/update --format true
+          fi
+          node -e "const c=require('./now.config.json'); const create=process.env.APP_OPERATION==='create'; if(c.scope !== process.env.APP_SCOPE || (!create && c.scopeId !== process.env.APP_SYS_ID) || (create && !/^[a-f0-9]{32}$/.test(c.scopeId || ''))) throw new Error('Application identity mismatch')"
+          WORKFLOW_COPY="$RUNNER_TEMP/servicenow-deploy.yml"
+          cp "$GITHUB_WORKSPACE/.github/workflows/servicenow-deploy.yml" "$WORKFLOW_COPY"
+          cd "$GITHUB_WORKSPACE"
+          git switch --orphan "$TARGET_BRANCH"
+          git rm -rf --ignore-unmatch .
+          cp -R "$PREP_DIR"/. .
+          mkdir -p .github/workflows
+          cp "$WORKFLOW_COPY" .github/workflows/servicenow-deploy.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: initialize ServiceNow application $APP_SCOPE"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          gh workflow run servicenow-deploy.yml --ref "$TARGET_BRANCH" -f preflight_only="$PREFLIGHT_ONLY"
+
+  prepare:
+    name: Validate Fluent and materialize keys
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.preflight_only)
+    permissions:
+      actions: write
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the reviewed PR branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+          fetch-depth: 0
+      - name: Use Node.js 20
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install pinned dependencies
+        run: npm ci
+      - name: Compile Fluent and generate deterministic keys
+        run: npm run build
+      - name: Block build-time edits outside generated keys
+        run: git diff --exit-code -- . ':(exclude)src/fluent/generated/keys.ts'
+      - name: Persist generated keys on the PR branch
+        id: persist-keys
+        run: |
+          if git diff --quiet -- src/fluent/generated/keys.ts; then
+            echo "Fluent keys are already current."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/fluent/generated/keys.ts
+          git commit -m "chore: refresh ServiceNow Fluent keys"
+          git push origin "HEAD:${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Validate the generated-key head
+        if: steps.persist-keys.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run servicenow-deploy.yml --ref "${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}" -f preflight_only=true
+
+  deploy:
+    if: >-
+      (github.event_name == 'push' && github.ref_name != 'main' && !startsWith(github.ref_name, 'zelviro-prepare/') && !startsWith(github.event.head_commit.message, 'chore: initialize ServiceNow application ')) || (github.event_name == 'workflow_dispatch' && github.ref_name != 'main' && !inputs.preflight_only)
+    name: Build and install the selected ServiceNow app
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: servicenow-nonprod
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Use Node.js 20
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install pinned dependencies
+        run: npm ci
+      - name: Verify deterministic Fluent keys and build
+        run: npm run build -- --frozenKeys
+      - name: Install reviewed app in non-production ServiceNow
+        env:
+          SN_SDK_NODE_ENV: SN_SDK_CI_INSTALL
+          SN_SDK_AUTH_TYPE: oauth
+          SN_SDK_INSTANCE_URL: ${{ secrets.SN_SDK_INSTANCE_URL }}
+          SN_SDK_OAUTH_CLIENT_ID: ${{ secrets.SN_SDK_OAUTH_CLIENT_ID }}
+          SN_SDK_OAUTH_CLIENT_SECRET: ${{ secrets.SN_SDK_OAUTH_CLIENT_SECRET }}
+        run: npx now-sdk install --demoData=false --skip-flow-activation
