@@ -1,0 +1,12 @@
+{
+  "name": "zelviro-servicenow-template",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Credential-free ServiceNow SDK starter for Zelviro governed development",
+  "scripts": {
+    "build": "now-sdk build"
+  },
+  "devDependencies": {
+    "@servicenow/sdk": "4.9.2"
+  }
+}
