@@ -1,23 +1,32 @@
 name: ServiceNow non-production SDK deploy
+run-name: ${{ inputs.baseline_request_id && format('Zelviro AI baseline {0}', inputs.baseline_request_id) || github.workflow }}
 
 on:
   pull_request:
     branches:
       - main
-      - 'zelviro-app/**'
+      - "zelviro-app/**"
     paths:
-      - 'src/fluent/**'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'now.config.json'
-      - '.github/workflows/servicenow-deploy.yml'
+      - "src/fluent/**"
+      - "package.json"
+      - "package-lock.json"
+      - "now.config.json"
+      - ".github/workflows/servicenow-deploy.yml"
   push:
     branches:
       - main
-      - 'zelviro-app/**'
-      - 'zelviro-prepare/**'
+      - "zelviro-app/**"
+      - "zelviro-prepare/**"
   workflow_dispatch:
     inputs:
+      baseline_sha:
+        description: Exact reviewed commit for an explicit baseline installation
+        required: false
+        type: string
+      baseline_request_id:
+        description: Zelviro AI baseline request identifier
+        required: false
+        type: string
       preflight_only:
         description: Validate a generated-key PR head without deployment
         required: false
@@ -46,10 +55,14 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
-      - name: Use Node.js 20
+      - name: Use Node.js 22
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 20
+          node-version: 22
+      - name: Install the reviewed SDK before initialization
+        run: |
+          npm ci --ignore-scripts
+          node zelviro/security-hardening.cjs
       - name: Validate the application preparation manifest
         run: |
           set -euo pipefail
@@ -113,13 +126,451 @@ jobs:
           cd "$PREP_DIR"
           if [ "$APP_OPERATION" = "create" ]; then
             APP_NAME="$(printf '%s' "$APP_NAME_B64" | base64 --decode)"
-            npm exec --yes --package=@servicenow/sdk@4.9.2 -- now-sdk init --appName "$APP_NAME" --packageName "$PACKAGE_NAME" --scopeName "$APP_SCOPE" --template base
+            "$GITHUB_WORKSPACE/node_modules/.bin/now-sdk" init --sdkVersion 4.9.2 --noUpdate --appName "$APP_NAME" --packageName "$PACKAGE_NAME" --scopeName "$APP_SCOPE" --template base
           else
-            npm exec --yes --package=@servicenow/sdk@4.9.2 -- now-sdk init --from "$APP_SYS_ID" --packageName "$PACKAGE_NAME" --template base
+            "$GITHUB_WORKSPACE/node_modules/.bin/now-sdk" init --sdkVersion 4.9.2 --noUpdate --from "$APP_SYS_ID" --packageName "$PACKAGE_NAME" --template base
           fi
-          npm install
+          # Instance authentication is needed only during initialization.
+          unset SN_SDK_OAUTH_CLIENT_SECRET SN_SDK_OAUTH_CLIENT_ID SN_SDK_INSTANCE_URL SN_SDK_AUTH_TYPE SN_SDK_NODE_ENV
+          # Preserve generated app identity/imports; freeze dependencies to the reviewed starter.
+          node <<'PIN_DEPENDENCIES'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const trusted = JSON.parse(fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, 'package.json'), 'utf8'))
+          const generated = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+            for (const [name, version] of Object.entries(generated[section] || {})) {
+              if (trusted[section]?.[name] !== version) throw new Error('Unreviewed generated SDK dependency: ' + name)
+            }
+            if (trusted[section]) generated[section] = trusted[section]
+            else delete generated[section]
+          }
+          generated.scripts = trusted.scripts
+          generated.overrides = trusted.overrides
+          const lock = JSON.parse(fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, 'package-lock.json'), 'utf8'))
+          lock.name = lock.packages[''].name = generated.name
+          lock.version = lock.packages[''].version = generated.version
+          fs.writeFileSync('package.json', JSON.stringify(generated, null, 2) + '\n')
+          fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2) + '\n')
+          fs.mkdirSync('zelviro', { recursive: true })
+          fs.copyFileSync(path.join(process.env.GITHUB_WORKSPACE, 'zelviro/security-hardening.cjs'), 'zelviro/security-hardening.cjs')
+          PIN_DEPENDENCIES
+          npm ci --ignore-scripts
+          node zelviro/security-hardening.cjs
           if [ -d metadata/update ]; then
             npx now-sdk transform --from metadata/update --format true
+          fi
+          # Materialize keys before normalization; never regenerate them to repair a move.
+          npm run build
+          if [ "$APP_OPERATION" = "import" ]; then
+            node <<'NORMALIZE_TABLES'
+          // BEGIN ZELVIRO AI TABLE NORMALIZER
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const crypto = require('node:crypto')
+          const { createRequire } = require('node:module')
+          const { execFileSync } = require('node:child_process')
+          const projectRequire = createRequire(path.join(process.cwd(), 'package.json'))
+          const { ts } = projectRequire('ts-morph') // Pinned SDK 4.9.2 build dependency.
+          const fail = (reason) => { throw new Error('Table normalization refused: ' + reason) }
+          const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+          const literal = (node) => node && ts.isStringLiteral(node) ? node.text : null
+          const nameOf = (node) => node && (ts.isIdentifier(node) || ts.isStringLiteral(node)) ? node.text : null
+          const parse = (file) => {
+            const source = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
+            if (source.parseDiagnostics.length) fail('unparseable source: ' + file)
+            return source
+          }
+          // Inspect only parent names, never unrelated root contents (e.g. node_modules).
+          // Linux may contain both src and SRC; reject aliases before following either.
+          const directoryNames = (directory, canonical = [], unique = true) => {
+            const names = fs.readdirSync(directory).sort()
+            if (names.length > 2000) fail('directory entry limit')
+            const folded = new Set()
+            for (const name of names) {
+              const lower = name.toLowerCase()
+              if (unique && folded.has(lower) ||
+                  canonical.some((expected) => expected.toLowerCase() === lower && expected !== name)) fail('case-insensitive path collision: ' + directory + '/' + name)
+              folded.add(lower)
+            }
+            return names
+          }
+          const governedChildren = {
+            src: ['fluent'],
+            'src/fluent': ['generated'],
+            'src/fluent/generated': ['data'],
+            'src/fluent/generated/data': ['table']
+          }
+          const walk = (root) => {
+            directoryNames('.', [root], false)
+            const files = []
+            let bytes = 0, entries = 0
+            const visit = (file, depth) => {
+              if (depth > 20 || ++entries > 2000) fail('file count or depth limit')
+              const stat = fs.lstatSync(file)
+              if (stat.isSymbolicLink()) fail('symbolic link: ' + file)
+              if (stat.isDirectory()) {
+                for (const child of directoryNames(file, governedChildren[file] || [])) visit(file + '/' + child, depth + 1)
+              } else if (stat.isFile()) {
+                bytes += stat.size
+                if (stat.size > 2000000 || bytes > 16000000) fail('source size limit')
+                files.push(file)
+              } else fail('non-regular source: ' + file)
+            }
+            if (fs.existsSync(root)) visit(root, 0)
+            return files
+          }
+          const snapshot = (files) => Object.fromEntries(files.sort().map((file) => {
+            const stat = fs.lstatSync(file)
+            if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2000000) fail('unsafe snapshot file: ' + file)
+            return [file, hash(fs.readFileSync(file))]
+          }))
+          const same = (left, right) => JSON.stringify(left) === JSON.stringify(right)
+          const sourceFiles = walk('src')
+          const candidates = sourceFiles.filter((file) => /^src\/fluent\/generated\/data\/table\/[A-Za-z0-9_.-]+\.now\.ts$/.test(file))
+          if (sourceFiles.some((file) => file.startsWith('src/fluent/generated/data/table/') && file.endsWith('.now.ts') && !candidates.includes(file))) fail('unsupported imported Table path')
+          if (candidates.length > 100) fail('table limit')
+          const config = JSON.parse(fs.readFileSync('now.config.json', 'utf8'))
+          if (!/^[a-f0-9]{32}$/.test(process.env.APP_SYS_ID || '') ||
+              config.scopeId !== process.env.APP_SYS_ID || config.scope !== process.env.APP_SCOPE ||
+              !/^(global|x_[a-z0-9_]{3,100})$/.test(config.scope || '')) fail('application identity mismatch')
+          // Extracted repair helper must not execute custom build/deployment lifecycle hooks.
+          const scripts = JSON.parse(fs.readFileSync('package.json', 'utf8')).scripts
+          if (scripts?.build !== 'now-sdk build' || scripts.prebuild || scripts.postbuild) fail('unsupported build command or lifecycle hook')
+          const keysFile = 'src/fluent/generated/keys.ts'
+          const allFiles = () => [...walk('src'), ...walk('metadata'), 'now.config.json', 'package.json', 'package-lock.json']
+          const before = snapshot(allFiles())
+          const compiled = () => snapshot(walk('dist').filter((file) => file.endsWith('.xml')))
+          const beforeXml = compiled()
+          const keys = new Map()
+          const composite = new Map()
+          const members = (type) => {
+            if (!type || !ts.isTypeLiteralNode(type)) fail('nonliteral key mapping')
+            const result = new Map()
+            for (const field of type.members) {
+              const name = nameOf(field.name)
+              if (!ts.isPropertySignature(field) || !name || result.has(name) || field.questionToken) fail('ambiguous key mapping')
+              result.set(name, field.type)
+            }
+            return result
+          }
+          const typeString = (type) => type && ts.isLiteralTypeNode(type) ? literal(type.literal) : null
+          if (candidates.length && (!fs.existsSync(keysFile) || !Object.keys(beforeXml).length)) fail('materialized keys and compiled XML required')
+          if (candidates.length && fs.existsSync(keysFile)) {
+            const keySource = parse(keysFile)
+            const scanKeys = (node) => {
+              if (ts.isInterfaceDeclaration(node) && node.name.text === 'Keys') {
+                for (const member of node.members) {
+                  if (nameOf(member.name) === 'composite') {
+                    if (!member.type || !ts.isTupleTypeNode(member.type)) fail('nonliteral composite keys')
+                    for (const entry of member.type.elements) {
+                      const fields = members(entry)
+                      if (typeString(fields.get('table')) !== 'sys_db_object') continue
+                      const identity = members(fields.get('key'))
+                      const name = typeString(identity.get('name'))
+                      const id = typeString(fields.get('id'))
+                      if (identity.size !== 1 || !name || !/^[a-f0-9]{32}$/.test(id || '') || composite.has(name)) fail('ambiguous composite Table key')
+                      composite.set(name, id)
+                    }
+                    continue
+                  }
+                  if (nameOf(member.name) !== 'explicit') continue
+                  if (!member.type || !ts.isTypeLiteralNode(member.type)) fail('nonliteral explicit keys')
+                  for (const entry of member.type.members) {
+                    const key = nameOf(entry.name)
+                    if (!key || keys.has(key) || !entry.type || !ts.isTypeLiteralNode(entry.type)) fail('ambiguous key')
+                    const fields = new Map()
+                    for (const field of entry.type.members) {
+                      const name = nameOf(field.name)
+                      const value = field.type && ts.isLiteralTypeNode(field.type) ? literal(field.type.literal) : null
+                      if (!name || fields.has(name) || value === null) fail('nonliteral key mapping')
+                      fields.set(name, value)
+                    }
+                    keys.set(key, { table: fields.get('table'), id: fields.get('id') })
+                  }
+                }
+              }
+              ts.forEachChild(node, scanKeys)
+            }
+            scanKeys(keySource)
+          }
+          // Bounded XML tokenization: never resolve entities or execute DTDs. Only direct,
+          // plain name/sys_id fields establish identity; labels/comments/CDATA elsewhere
+          // are preserved untouched and every XML byte is compared after frozen build.
+          const readXmlTables = (files) => {
+          const found = new Map(), ids = new Set()
+          const add = (table, id, format, file) => {
+            if (!/^[a-z][a-z0-9_]*$/.test(table || '') || !/^[a-f0-9]{32}$/.test(id || '') ||
+                found.has(table) || ids.has(id)) fail('duplicate or invalid compiled Table identity')
+            found.set(table, { id, format, file })
+            ids.add(id)
+          }
+          for (const file of files) {
+            const xml = fs.readFileSync(file, 'utf8')
+            const dictionary = file.includes('/dictionary/')
+            if (!dictionary && !/<sys_db_object(?:\s|>)/.test(xml)) continue
+            const tokens = /<!--(?:(?!--)[\s\S])*-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?xml\s[^<>]*\?>|<\/[A-Za-z_][\w:.-]*\s*>|<[A-Za-z_][\w:.-]*(?:\s+[A-Za-z_][\w:.-]*\s*=\s*(?:"[^"<]*"|'[^'<]*'))*\s*\/?>|[^<]+/gy
+            const stack = []
+            let root = false, record = null, field = null, offset = 0, count = 0, collections = 0
+            const close = (name) => {
+              if (stack.pop() !== name) fail('malformed compiled Table XML')
+              if (field && stack.length === 2) {
+                if (!/^(?:[a-z][a-z0-9_]*|[a-f0-9]{32})$/.test(field.value.trim())) fail('encoded or invalid compiled identity')
+                record.set(field.name, field.value.trim())
+                field = null
+              }
+              if (name === 'sys_db_object') {
+                const table = record.get('name'), id = record.get('sys_id')
+                add(table, id, 'sys_db_object', file)
+                record = null
+              }
+            }
+            while (offset < xml.length) {
+              const match = tokens.exec(xml)
+              if (!match || match.index !== offset || ++count > 100000) fail('unsupported compiled Table XML: ' + file)
+              const token = match[0]
+              offset = tokens.lastIndex
+              if (token.startsWith('<?')) {
+                if (match.index !== 0) fail('unexpected XML declaration')
+              } else if (token.startsWith('<!')) {
+                if (field || !stack.length && !token.startsWith('<!--')) fail('ambiguous compiled identity')
+              } else if (token.startsWith('</')) {
+                close(token.slice(2, -1).trim())
+              } else if (token.startsWith('<')) {
+                if (field) fail('nested compiled identity')
+                const name = /^<([\w:.-]+)/.exec(token)[1]
+                const attrs = new Map()
+                for (const attr of token.matchAll(/([A-Za-z_][\w:.-]*)\s*=\s*(?:"([^"<]*)"|'([^'<]*)')/g)) {
+                  if (attrs.has(attr[1]) || attr[1] === 'xmlns' || attr[1].includes(':')) fail('ambiguous XML attribute or namespace')
+                  attrs.set(attr[1], attr[2] ?? attr[3])
+                }
+                if (name.includes(':')) fail('ambiguous XML namespace')
+                if (!stack.length) {
+                  if (root || !(dictionary ? name === 'database' : ['record_update', 'unload'].includes(name))) fail('unexpected compiled XML root')
+                  root = true
+                }
+                if (dictionary && stack.length) {
+                  if (name !== 'element') fail('unexpected dictionary element')
+                  if (stack.length === 1) {
+                    if (++collections !== 1 || attrs.get('type') !== 'collection') fail('one direct dictionary collection required')
+                    add(attrs.get('name'), attrs.get('db_object_id'), 'dictionary', file)
+                  } else if (attrs.has('db_object_id') || attrs.get('type') === 'collection') fail('nested dictionary collection')
+                }
+                if (name === 'sys_db_object') {
+                  if (stack.length !== 1 || record) fail('nested compiled Table')
+                  record = new Map()
+                } else if (record && stack.length === 2 && ['name', 'sys_id'].includes(name)) {
+                  if (record.has(name) || token !== '<' + name + '>') fail('ambiguous compiled identity')
+                  field = { name, value: '' }
+                }
+                stack.push(name)
+                if (token.endsWith('/>')) close(name)
+              } else if (field) field.value += token
+              else if (!stack.length && token.trim()) fail('unexpected XML text')
+            }
+            if (!root || stack.length || record || dictionary && collections !== 1) fail('incomplete compiled Table XML')
+          }
+          return found
+          }
+          const xmlTables = candidates.length ? readXmlTables(Object.keys(beforeXml)) : new Map()
+          const rawTables = candidates.length ? readXmlTables(Object.keys(before).filter((file) => file.startsWith('metadata/dictionary/') && file.endsWith('.xml'))) : new Map()
+          // SDK 4.9.2 regenerates exactly two volatile CycloneDX fields. This exception
+          // is bound to the frozen bom_json registry entry and the exact module envelope;
+          // other modules, XML bytes, dependencies and BOM properties remain protected.
+          const bomKey = keys.get('bom_json')
+          const bomFile = bomKey && bomKey.table === 'sys_module' && /^[a-f0-9]{32}$/.test(bomKey.id || '')
+            ? 'dist/app/update/sys_module_' + bomKey.id + '.xml' : null
+          const packageInfo = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          const comparableXml = (hashes) => {
+            const result = { ...hashes }
+            if (!bomFile || !Object.hasOwn(result, bomFile)) return result
+            const xml = fs.readFileSync(bomFile, 'utf8')
+            const match = /^(?<prefix><\?xml version="1.0"\?>\s*<record_update>\s*<sys_module action="INSERT_OR_UPDATE">\s*<sys_id>(?<id>[a-f0-9]{32})<\/sys_id>\s*<sys_scope display_value="(?<scopeName>[a-z0-9_]+)">(?<scopeId>[a-f0-9]{32})<\/sys_scope>\s*<path>(?<modulePath>[^<>&]+)<\/path>\s*<external_source>false<\/external_source>\s*<content><!\[CDATA\[)(?<payload>[\s\S]*)(?<suffix>\]\]><\/content>\s*<\/sys_module>\s*<\/record_update>\s*)$/.exec(xml)?.groups
+            if (!match || match.id !== bomKey.id || match.scopeName !== config.scope || match.scopeId !== config.scopeId ||
+                match.modulePath !== config.scope + '/' + packageInfo.name + '/' + packageInfo.version + '/bom.json' ||
+                match.payload.includes(']]>')) fail('unproven BOM module')
+            const bom = JSON.parse(match.payload)
+            const jsonSource = ts.parseJsonText('bom.json', match.payload)
+            const checkJson = (node) => {
+              if (ts.isObjectLiteralExpression(node)) {
+                const names = new Set()
+                for (const prop of node.properties) {
+                  const name = nameOf(prop.name)
+                  if (!name || names.has(name)) fail('ambiguous BOM JSON')
+                  names.add(name)
+                }
+              }
+              if (ts.isNumericLiteral(node) && !Number.isSafeInteger(Number(node.text))) fail('unsupported BOM number')
+              ts.forEachChild(node, checkJson)
+            }
+            checkJson(jsonSource)
+            if (!bom || bom.bomFormat !== 'CycloneDX' || bom.specVersion !== '1.6' ||
+                bom.$schema !== 'http://cyclonedx.org/schema/bom-1.6.schema.json' ||
+                typeof bom.serialNumber !== 'string' || !/^urn:uuid:[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(bom.serialNumber || '') ||
+                !bom.metadata || Array.isArray(bom.metadata) || typeof bom.metadata !== 'object' ||
+                typeof bom.metadata.timestamp !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(bom.metadata.timestamp || '')) fail('unproven CycloneDX volatility')
+            delete bom.serialNumber
+            delete bom.metadata.timestamp
+            const canonical = (value) => Array.isArray(value) ? value.map(canonical)
+              : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])) : value
+            result[bomFile] = hash(match.prefix + JSON.stringify(canonical(bom)) + match.suffix)
+            return result
+          }
+          const beforeComparableXml = comparableXml(beforeXml)
+          const reference = (file, node) => {
+            const module = literal(node)
+            if (!module) fail('unproven module reference: ' + file)
+            if (module.startsWith('@servicenow/sdk/')) return
+            if (!module.startsWith('.')) fail('unproven module reference: ' + file)
+            const host = {
+              fileExists: (name) => fs.existsSync(name) && fs.lstatSync(name).isFile(),
+              readFile: (name) => fs.readFileSync(name, 'utf8')
+            }
+            const resolved = ts.resolveModuleName(module, file, { moduleResolution: ts.ModuleResolutionKind.Node10, allowJs: true }, host).resolvedModule
+            if (!resolved) fail('unresolved module reference: ' + file)
+            const target = path.posix.normalize(resolved.resolvedFileName)
+            if (!sourceFiles.includes(target) || candidates.includes(target)) fail('relocated or unproven module reference: ' + file)
+          }
+          const inventory = []
+          const plans = []
+          const seenNames = new Set()
+          const seenIds = new Set()
+          for (const file of (candidates.length ? sourceFiles : []).filter((file) => /\.(?:[cm]?[jt]sx?)$/.test(file) && file !== keysFile)) {
+            const source = parse(file)
+            const candidate = candidates.includes(file)
+            const tables = new Set()
+            const allowedCalls = new Set()
+            for (const statement of source.statements) {
+              if (!ts.isImportDeclaration(statement)) continue
+              const module = literal(statement.moduleSpecifier)
+              if (candidate && module !== '@servicenow/sdk/core' && module !== '@servicenow/sdk/global') fail('candidate import: ' + file)
+              if (module === '@servicenow/sdk/core') {
+                const clause = statement.importClause
+                if (!clause || clause.isTypeOnly || clause.name || !clause.namedBindings || !ts.isNamedImports(clause.namedBindings)) fail('ambiguous SDK import: ' + file)
+                for (const item of clause.namedBindings.elements) {
+                  const imported = (item.propertyName || item.name).text
+                  if (imported === 'Table') tables.add(item.name.text)
+                  if (candidate && imported !== 'Table' && !/^[A-Za-z]+Column$/.test(imported)) fail('mixed candidate APIs: ' + file)
+                  allowedCalls.add(item.name.text)
+                }
+              } else if (candidate && statement.importClause) fail('unexpected global import: ' + file)
+            }
+            const calls = []
+            const inspect = (node) => {
+              // Resolve literal local edges; unrelated server modules do not move.
+              if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) reference(file, node.moduleSpecifier)
+              if (ts.isImportEqualsDeclaration(node)) {
+                if (!ts.isExternalModuleReference(node.moduleReference)) fail('unproven module reference: ' + file)
+                reference(file, node.moduleReference.expression)
+              }
+              if (ts.isImportTypeNode(node)) {
+                if (!ts.isLiteralTypeNode(node.argument)) fail('unproven module reference: ' + file)
+                reference(file, node.argument.literal)
+              }
+              if (ts.isIdentifier(node) && tables.has(node.text) &&
+                  !ts.isImportSpecifier(node.parent) &&
+                  !(ts.isCallExpression(node.parent) && node.parent.expression === node)) fail('indirect Table binding: ' + file)
+              if (ts.isCallExpression(node)) {
+                if (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+                    ts.isIdentifier(node.expression) && node.expression.text === 'require' ||
+                    ts.isPropertyAccessExpression(node.expression) && ts.isIdentifier(node.expression.expression) &&
+                    (node.expression.expression.text === 'require' ||
+                     node.expression.expression.text === 'Now' && node.expression.name.text === 'include')) {
+                  if (node.arguments.length !== 1) fail('unproven module reference: ' + file)
+                  reference(file, node.arguments[0])
+                }
+                if (ts.isIdentifier(node.expression) && ['eval', 'Function'].includes(node.expression.text)) fail('dynamic source: ' + file)
+                if (ts.isIdentifier(node.expression) && tables.has(node.expression.text)) calls.push(node)
+                if (candidate && (!ts.isIdentifier(node.expression) || !allowedCalls.has(node.expression.text))) fail('nondeclarative candidate call: ' + file)
+              }
+              if (candidate && (ts.isSpreadAssignment(node) || ts.isComputedPropertyName(node) ||
+                  ts.isNewExpression(node) || ts.isFunctionLike(node) || ts.isTaggedTemplateExpression(node))) fail('unsupported candidate expression: ' + file)
+              ts.forEachChild(node, inspect)
+            }
+            inspect(source)
+            if (candidate) {
+              const declarations = source.statements.filter((node) => !ts.isImportDeclaration(node) && !ts.isEmptyStatement(node))
+              if (calls.length !== 1 || declarations.length !== 1 || !ts.isVariableStatement(declarations[0]) ||
+                  !(declarations[0].declarationList.flags & ts.NodeFlags.Const) ||
+                  !declarations[0].modifiers?.some((node) => node.kind === ts.SyntaxKind.ExportKeyword) ||
+                  declarations[0].declarationList.declarations.length !== 1 ||
+                  declarations[0].declarationList.declarations[0].initializer !== calls[0]) fail('one exported Table required: ' + file)
+            }
+            for (const call of calls) {
+              if (call.arguments.length !== 1 || !ts.isObjectLiteralExpression(call.arguments[0])) fail('nonliteral Table: ' + file)
+              const fields = new Map()
+              for (const prop of call.arguments[0].properties) {
+                const name = nameOf(prop.name)
+                if (!ts.isPropertyAssignment(prop) || !name || fields.has(name)) fail('ambiguous Table properties: ' + file)
+                fields.set(name, prop.initializer)
+              }
+              const table = literal(fields.get('name'))
+              const idNode = fields.get('$id')
+              let id = literal(idNode)
+              if (!id && idNode && ts.isElementAccessExpression(idNode) &&
+                  ts.isPropertyAccessExpression(idNode.expression) &&
+                  ts.isIdentifier(idNode.expression.expression) && idNode.expression.expression.text === 'Now' &&
+                  idNode.expression.name.text === 'ID') {
+                const key = keys.get(literal(idNode.argumentExpression))
+                if (!key || key.table !== 'sys_db_object') fail('unproven Table key: ' + file)
+                id = key.id
+              }
+              if (!idNode) id = composite.get(table)
+              if (!table || !/^[a-z][a-z0-9_]*$/.test(table) || !/^[a-f0-9]{32}$/.test(id || '')) fail('unproven Table identity: ' + file)
+              if (seenNames.has(table) || seenIds.has(id)) fail('duplicate Table name or identity')
+              seenNames.add(table)
+              seenIds.add(id)
+              const compiledIdentity = xmlTables.get(table)
+              const rawIdentity = rawTables.get(table)
+              inventory.push({ table, sdkId: id, effectiveCompiledId: compiledIdentity?.id || null,
+                compiledFormat: compiledIdentity?.format || null, rawDictionaryId: rawIdentity?.id || null })
+              if (candidate) {
+                if (!compiledIdentity || rawIdentity && rawIdentity.id !== compiledIdentity.id) fail('compiled Table identity mismatch: ' + file)
+                // SDK natural keys and native dictionary IDs may differ after import.
+                // Permit that pre-existing precedence only for implicit IDs, backed by
+                // unique name-bound raw AND compiled dictionary identity. Never rewrite either.
+                if (compiledIdentity.id !== id && (idNode || compiledIdentity.format !== 'dictionary' ||
+                    rawIdentity?.id !== compiledIdentity.id)) fail('unproven native dictionary identity: ' + file)
+                if (!(config.scope === 'global' ? table.startsWith('u_') : table.startsWith(config.scope + '_'))) fail('foreign Table scope: ' + file)
+                const declaration = call.parent
+                if (!ts.isVariableDeclaration(declaration) || !ts.isIdentifier(declaration.name) || declaration.name.text !== table) fail('noncanonical Table export: ' + file)
+                const target = 'src/fluent/' + table + '.now.ts'
+                directoryNames('src/fluent', [table + '.now.ts'])
+                if (sourceFiles.some((existing) => existing.toLowerCase() === target.toLowerCase()) || fs.existsSync(target)) fail('destination collision: ' + target)
+                plans.push({ from: file, to: target, sha256: before[file] })
+              }
+            }
+          }
+          if (plans.length !== candidates.length) fail('unrecognized imported Table')
+          const expected = { ...before }
+          for (const plan of plans) { delete expected[plan.from]; expected[plan.to] = plan.sha256 }
+          const ordered = (value) => Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
+          const moved = []
+          try {
+            for (const plan of plans) {
+              if (fs.existsSync(plan.to) || hash(fs.readFileSync(plan.from)) !== plan.sha256) fail('source changed before move')
+              fs.renameSync(plan.from, plan.to)
+              moved.push(plan)
+            }
+            // Same frozen-only validation for new imports and extracted, pinned-head repairs.
+            execFileSync('npm', ['run', 'build', '--', '--frozenKeys'], { stdio: 'inherit', timeout: 240000 })
+            if (!same(ordered(expected), ordered(snapshot(allFiles())))) fail('keys, metadata, config or source changed')
+            const afterXml = compiled()
+            if (plans.length && !same(beforeComparableXml, comparableXml(afterXml))) fail('compiled XML changed')
+            console.log(JSON.stringify({ normalizedTables: plans, inventory, keysSha256: before[keysFile] || null,
+              compiledXmlSha256: { before: beforeXml, after: afterXml },
+              bomVolatility: bomFile && Object.hasOwn(beforeXml, bomFile) ? { file: bomFile, ignoredFields: ['serialNumber', 'metadata.timestamp'] } : null }))
+          } catch (error) {
+            // No publication follows a failure. Restore moved source in this scratch tree.
+            for (const plan of moved.reverse()) {
+              if (!fs.existsSync(plan.from) && fs.existsSync(plan.to)) fs.renameSync(plan.to, plan.from)
+            }
+            throw error
+          }
+          // END ZELVIRO AI TABLE NORMALIZER
+          NORMALIZE_TABLES
+          else
+            npm run build -- --frozenKeys
           fi
           node -e "const c=require('./now.config.json'); const create=process.env.APP_OPERATION==='create'; if(c.scope !== process.env.APP_SCOPE || (!create && c.scopeId !== process.env.APP_SYS_ID) || (create && !/^[a-f0-9]{32}$/.test(c.scopeId || ''))) throw new Error('Application identity mismatch')"
           WORKFLOW_COPY="$RUNNER_TEMP/servicenow-deploy.yml"
@@ -145,19 +596,31 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      SDK_SOURCE_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
     steps:
       - name: Check out the reviewed PR branch
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
           fetch-depth: 0
-      - name: Use Node.js 20
+      - name: Use Node.js 22
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
-      - name: Install pinned dependencies
-        run: npm ci
+      - name: Validate source branch before write operations
+        run: |
+          node <<'NODE'
+          const branch = process.env.SDK_SOURCE_BRANCH;
+          if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(branch || '') || branch.includes('..')) {
+            throw new Error('Unsupported SDK source branch');
+          }
+          NODE
+      - name: Install and harden pinned dependencies
+        run: |
+          npm ci --ignore-scripts
+          node zelviro/security-hardening.cjs
       - name: Compile Fluent and generate deterministic keys
         run: npm run build
       - name: Block build-time edits outside generated keys
@@ -165,22 +628,23 @@ jobs:
       - name: Persist generated keys on the PR branch
         id: persist-keys
         run: |
-          if git diff --quiet -- src/fluent/generated/keys.ts; then
+          # Stage first: git diff alone ignores a newly generated, untracked file.
+          git add -- src/fluent/generated/keys.ts
+          if git diff --cached --quiet -- src/fluent/generated/keys.ts; then
             echo "Fluent keys are already current."
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/fluent/generated/keys.ts
           git commit -m "chore: refresh ServiceNow Fluent keys"
-          git push origin "HEAD:${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}"
+          git push origin "HEAD:$SDK_SOURCE_BRANCH"
           echo "changed=true" >> "$GITHUB_OUTPUT"
       - name: Validate the generated-key head
         if: steps.persist-keys.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run servicenow-deploy.yml --ref "${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}" -f preflight_only=true
+        run: gh workflow run servicenow-deploy.yml --ref "$SDK_SOURCE_BRANCH" -f preflight_only=true
 
   deploy:
     if: >-
@@ -190,15 +654,23 @@ jobs:
     timeout-minutes: 30
     environment: servicenow-nonprod
     steps:
+      - name: Verify reviewed baseline commit
+        env:
+          EXPECTED_BASELINE_SHA: ${{ inputs.baseline_sha }}
+        run: |
+          set -euo pipefail
+          test -z "$EXPECTED_BASELINE_SHA" || test "$EXPECTED_BASELINE_SHA" = "$GITHUB_SHA"
       - name: Check out reviewed source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: Use Node.js 20
+      - name: Use Node.js 22
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
-      - name: Install pinned dependencies
-        run: npm ci
+      - name: Install and harden pinned dependencies
+        run: |
+          npm ci --ignore-scripts
+          node zelviro/security-hardening.cjs
       - name: Verify deterministic Fluent keys and build
         run: npm run build -- --frozenKeys
       - name: Install reviewed app in non-production ServiceNow
