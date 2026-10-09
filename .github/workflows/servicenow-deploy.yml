@@ -130,6 +130,8 @@ jobs:
           else
             "$GITHUB_WORKSPACE/node_modules/.bin/now-sdk" init --sdkVersion 4.9.2 --noUpdate --from "$APP_SYS_ID" --packageName "$PACKAGE_NAME" --template base
           fi
+          # Instance authentication is needed only during initialization.
+          unset SN_SDK_OAUTH_CLIENT_SECRET SN_SDK_OAUTH_CLIENT_ID SN_SDK_INSTANCE_URL SN_SDK_AUTH_TYPE SN_SDK_NODE_ENV
           # Preserve generated app identity/imports; freeze dependencies to the reviewed starter.
           node <<'PIN_DEPENDENCIES'
           const fs = require('node:fs')
