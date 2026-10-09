@@ -26,3 +26,11 @@ customer identity, OAuth client, or secret is included in this template.
 Do not install the placeholder `x_zelviro_template` project. It exists only so
 Zelviro can verify the repository contract before the first application is
 selected.
+
+## Local build
+
+Use Node.js 22 LTS. Install the reviewed dependencies with
+`npm ci --ignore-scripts`, run `node zelviro/security-hardening.cjs`, then
+`npm run build`. Keep `package.json`, `package-lock.json`, the security script,
+and the workflow together when upgrading an existing repository. The workflow
+alone is not a complete dependency-security upgrade.
