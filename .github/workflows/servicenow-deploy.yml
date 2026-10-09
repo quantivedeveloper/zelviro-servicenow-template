@@ -594,6 +594,8 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      SDK_SOURCE_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
     steps:
       - name: Check out the reviewed PR branch
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -605,6 +607,14 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Validate source branch before write operations
+        run: |
+          node <<'NODE'
+          const branch = process.env.SDK_SOURCE_BRANCH;
+          if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(branch || '') || branch.includes('..')) {
+            throw new Error('Unsupported SDK source branch');
+          }
+          NODE
       - name: Install and harden pinned dependencies
         run: |
           npm ci --ignore-scripts
@@ -626,13 +636,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: refresh ServiceNow Fluent keys"
-          git push origin "HEAD:${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}"
+          git push origin "HEAD:$SDK_SOURCE_BRANCH"
           echo "changed=true" >> "$GITHUB_OUTPUT"
       - name: Validate the generated-key head
         if: steps.persist-keys.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run servicenow-deploy.yml --ref "${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}" -f preflight_only=true
+        run: gh workflow run servicenow-deploy.yml --ref "$SDK_SOURCE_BRANCH" -f preflight_only=true
 
   deploy:
     if: >-
